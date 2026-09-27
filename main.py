@@ -4,6 +4,7 @@ import json
 import re
 import html as _html
 import time
+import os
 import requests
 from typing import Dict, List, Any, Optional
 
@@ -57,6 +58,16 @@ class SiriusParser:
         self.session = requests.Session()
         self.session.headers.update(HEADERS_BASE)
         
+        # --- ВАРИАНТ 1: НАСТРОЙКА ПРОКСИ ---
+        # Вставьте адрес вашего прокси-сервера (например, из РФ).
+        # Также можно задать через переменную окружения PROXY_URL в Render (Environment Variables).
+        proxy_url = os.getenv("PROXY_URL", "")  # Например: "http://username:password@ip:port" или "http://ip:port"
+        if proxy_url:
+            self.session.proxies = {
+                "http": proxy_url,
+                "https": proxy_url
+            }
+
         self.token: str = ""
         self.fingerprint: Dict[str, Any] = {}
         self.server_memo: Dict[str, Any] = {}
@@ -85,7 +96,8 @@ class SiriusParser:
             self.server_memo = initial_data["serverMemo"]
             self.component_name = self.fingerprint.get("name", "main-grid")
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] Session init failed: {e}")
             return False
 
     def set_group(self, group_code: str) -> bool:
