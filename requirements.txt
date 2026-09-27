@@ -1,4 +1,3 @@
 fastapi
 uvicorn
-playwright
-nest_asyncio
+requests
