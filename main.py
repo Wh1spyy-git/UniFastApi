@@ -1,14 +1,28 @@
 from fastapi import FastAPI, Query, HTTPException
 from datetime import datetime
 import json
+import re
+import html as _html
 import time
-import traceback
-import nest_asyncio
-from playwright.async_api import async_playwright
+import requests
+from typing import Dict, List, Any, Optional
 
-nest_asyncio.apply()
+app = FastAPI(title="Sirius UniHelper API", version="11.0")
 
-app = FastAPI(title="Sirius UniHelper API", version="4.0")
+BASE_URL = "https://schedule.siriusuniversity.ru"
+PAGE_URL = f"{BASE_URL}/"
+LIVEWIRE_ENDPOINT_TEMPLATE = f"{BASE_URL}/livewire/message/{{component}}"
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0 Safari/537.36"
+)
+
+HEADERS_BASE = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+}
 
 CACHE = {}
 CACHE_TTL = 3600
@@ -38,131 +52,234 @@ def set_to_cache(key: str, data: dict):
     CACHE[key] = (time.time(), data)
 
 
-async def parse_sirius_schedule(group_name: str, next_week: bool = False) -> list:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
+class SiriusParser:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS_BASE)
+        
+        self.token: str = ""
+        self.fingerprint: Dict[str, Any] = {}
+        self.server_memo: Dict[str, Any] = {}
+        self.component_name: str = "main-grid"
 
-        captured_events = []
-
-        async def handle_response(response):
-            nonlocal captured_events
-            if "livewire" in response.url and response.status == 200:
-                try:
-                    res_json = await response.json()
-                    server_memo = res_json.get("serverMemo", {})
-                    data = server_memo.get("data", {})
-                    events = data.get("events", [])
-
-                    if isinstance(events, dict):
-                        captured_events = []
-                        for k, l in events.items():
-                            if isinstance(l, list):
-                                captured_events.extend(l)
-                    elif isinstance(events, list) and events:
-                        captured_events = events
-                except Exception:
-                    pass
-
-        page.on("response", handle_response)
-
+    def init_session(self) -> bool:
         try:
-            await page.goto("https://schedule.siriusuniversity.ru/", wait_until="networkidle", timeout=30000)
+            resp = self.session.get(PAGE_URL, timeout=15)
+            resp.raise_for_status()
+            
+            html_content = resp.text
+            
+            token_match = re.search(r"livewire_token\s*=\s*['\"]([^'\"]+)['\"]", html_content)
+            if not token_match:
+                return False
+            self.token = token_match.group(1)
+            
+            data_match = re.search(r'wire:initial-data="([^"]+)"', html_content)
+            if not data_match:
+                return False
+                
+            raw_json = _html.unescape(data_match.group(1))
+            initial_data = json.loads(raw_json)
+            
+            self.fingerprint = initial_data["fingerprint"]
+            self.server_memo = initial_data["serverMemo"]
+            self.component_name = self.fingerprint.get("name", "main-grid")
+            return True
+        except Exception:
+            return False
 
-            select_group_trigger = page.locator('text="Выберите группу"', has_text="Выберите группу").first
-            if await select_group_trigger.is_visible():
-                await select_group_trigger.click()
-                await page.wait_for_timeout(500)
+    def set_group(self, group_code: str) -> bool:
+        updates = [
+            {
+                "type": "syncInput",
+                "payload": {
+                    "id": "group",
+                    "name": "group",
+                    "value": group_code
+                }
+            }
+        ]
+        return self._post_livewire(updates)
 
-            search_input = page.locator("#searchListInput")
-            await search_input.fill(group_name, force=True)
-            await search_input.dispatch_event("input")
-            await search_input.dispatch_event("change")
-            await page.wait_for_timeout(1000)
+    def navigate_to_offset(self, offset: int) -> bool:
+        """
+        Перелистывает недели на offset шагов.
+        Положительное число (напр. 2) -> перелистывает на 2 недели вперед.
+        Отрицательное число (напр. -1) -> перелистывает на 1 неделю назад.
+        """
+        if offset == 0:
+            return True
 
-            group_item = page.locator(f'text="{group_name}"').first
-            try:
-                if await group_item.is_visible(timeout=2000):
-                    await group_item.click()
-                else:
-                    await search_input.press("Enter")
-            except Exception:
-                await search_input.press("Enter")
+        method_name = "addWeek" if offset > 0 else "minusWeek"
+        steps = abs(offset)
 
-            await page.wait_for_timeout(2000)
+        for i in range(steps):
+            updates = [
+                {
+                    "type": "callMethod",
+                    "payload": {
+                        "id": f"nav_{i}",
+                        "method": method_name,
+                        "params": []
+                    }
+                }
+            ]
+            if not self._post_livewire(updates):
+                return False
+            time.sleep(0.1)  # Небольшая задержка между шагами
 
-            if next_week:
-                add_week_btn = page.locator('[wire\\:click="addWeek"]').first
-                if await add_week_btn.is_visible():
-                    await add_week_btn.click()
-                else:
-                    await page.evaluate("""() => {
-                        const el = document.querySelector('[wire\\\\:id]');
-                        if (el && window.Livewire) {
-                            const wireId = el.getAttribute('wire:id');
-                            const comp = window.Livewire.find(wireId);
-                            if (comp && typeof comp.addWeek === 'function') {
-                                comp.addWeek();
-                            } else if (comp && typeof comp.call === 'function') {
-                                comp.call('addWeek');
-                            }
-                        }
-                    }""")
+        return True
 
-                await page.wait_for_timeout(3000)
+    def parse_events(self) -> List[Dict[str, Any]]:
+        data = self.server_memo.get("data", {})
+        events_raw = data.get("events", {})
+        parsed_events = []
+        
+        if isinstance(events_raw, dict):
+            for day_key, day_events in events_raw.items():
+                if isinstance(day_events, list):
+                    for ev in day_events:
+                        parsed_event = self._normalize_event(ev, day_key)
+                        if parsed_event:
+                            parsed_events.append(parsed_event)
+        elif isinstance(events_raw, list):
+             for ev in events_raw:
+                 parsed_event = self._normalize_event(ev, "Unknown")
+                 if parsed_event:
+                     parsed_events.append(parsed_event)
+                
+        return parsed_events
 
-            if not captured_events:
-                div_rasp = await page.query_selector("div[wire\\:initial-data], div[wire\\:id]")
-                if div_rasp:
-                    raw_data = await div_rasp.get_attribute("wire:initial-data")
-                    if raw_data:
-                        parsed = json.loads(raw_data)
-                        events = parsed.get("serverMemo", {}).get("data", {}).get("events", [])
-                        if isinstance(events, dict):
-                            captured_events = []
-                            for k, l in events.items():
-                                if isinstance(l, list):
-                                    captured_events.extend(l)
-                        elif isinstance(events, list):
-                            captured_events = events
+    def _normalize_event(self, ev: Dict, day_label: str) -> Optional[Dict]:
+        if not isinstance(ev, dict):
+            return None
 
-        finally:
-            await browser.close()
+        subject = ev.get("subject") or ev.get("discipline") or ev.get("name") or "Без названия"
+        start_time = ev.get("startTime") or ev.get("start_time") or ""
+        end_time = ev.get("endTime") or ev.get("end_time") or ""
+        room = ev.get("room") or ev.get("auditorium") or ev.get("classroom") or "-"
+        teachers_list = self._extract_teachers(ev.get("teachers") or ev.get("teacher"))
+        event_type = ev.get("eventType") or ev.get("groupType") or ""
+        date_str = ev.get("date") or ""
 
-        return captured_events
+        return {
+            "date": date_str,
+            "day_label": str(day_label),
+            "time_start": start_time,
+            "time_end": end_time,
+            "title": subject,
+            "room": room,
+            "teacher": ", ".join(teachers_list) if teachers_list else "",
+            "type": event_type
+        }
+
+    def _extract_teachers(self, teachers_data: Any) -> List[str]:
+        if not teachers_data:
+            return []
+        names = []
+        if isinstance(teachers_data, dict):
+            for key, value in teachers_data.items():
+                if isinstance(value, dict):
+                    name = value.get("fio") or value.get("fullName") or value.get("name")
+                    if name:
+                        names.append(str(name))
+                elif isinstance(value, str):
+                    if len(value) > 2 and ' ' in value:
+                         names.append(value)
+        elif isinstance(teachers_data, list):
+            for item in teachers_data:
+                if isinstance(item, dict):
+                    name = item.get("fio") or item.get("fullName") or item.get("name")
+                    if name:
+                        names.append(str(name))
+                elif isinstance(item, str):
+                    names.append(item)
+        elif isinstance(teachers_data, str):
+            if teachers_data.strip():
+                names.append(teachers_data)
+        return names
+
+    def _post_livewire(self, updates: List[Dict]) -> bool:
+        url = LIVEWIRE_ENDPOINT_TEMPLATE.format(component=self.component_name)
+        payload = {
+            "fingerprint": self.fingerprint,
+            "serverMemo": self.server_memo,
+            "updates": updates
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "X-Livewire": "true",
+            "Referer": PAGE_URL,
+            "X-CSRF-TOKEN": self.token,
+            "Accept": "text/html, application/xhtml+xml",
+        }
+        try:
+            resp = self.session.post(url, json=payload, headers=headers, timeout=20)
+            if resp.status_code != 200:
+                return False
+            response_json = resp.json()
+            incoming_memo = response_json.get("serverMemo")
+            if not incoming_memo:
+                return False
+            self.server_memo = self._merge_server_memo(self.server_memo, incoming_memo)
+            return True
+        except Exception:
+            return False
+
+    def _merge_server_memo(self, old: Dict, new: Dict) -> Dict:
+        merged = old.copy()
+        for key, value in new.items():
+            if key == "data":
+                continue
+            merged[key] = value
+            
+        old_data = old.get("data", {})
+        new_data = new.get("data", {})
+        merged_data = old_data.copy()
+        critical_keys = ["group", "date", "numWeek", "count", "events"]
+        
+        for key, value in new_data.items():
+            if value is None and key in critical_keys and key in old_data and old_data[key] is not None:
+                continue
+            merged_data[key] = value
+            
+        merged["data"] = merged_data
+        return merged
+
+
+@app.get("/")
+def read_root():
+    return {"status": "online", "message": "Sirius Schedule API is running"}
 
 
 @app.get("/api/schedule")
-async def get_schedule(
-    group: str = Query(..., description="Название группы"),
-    next_week: bool = Query(False, description="Получить расписание на следующую неделю")
+def get_schedule(
+    group: str = Query(..., description="Название группы, например ИОП-ИТ-26/1"),
+    week_offset: int = Query(0, description="Смещение недели: 0 (текущая), 1 (следующая), 2 (через неделю), -1 (предыдущая)")
 ):
-    cache_key = f"{group.strip().upper()}_{'next' if next_week else 'current'}"
+    cache_key = f"{group.strip().upper()}_offset_{week_offset}"
     cached = get_from_cache(cache_key)
     if cached:
         return cached
 
-    try:
-        raw_lessons = await parse_sirius_schedule(group_name=group, next_week=next_week)
-    except Exception as e:
-        print("\n--- ОШИБКА ПАРСИНГА ---")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Ошибка парсинга расписания: {repr(e)}")
+    parser = SiriusParser()
+    if not parser.init_session():
+        raise HTTPException(status_code=502, detail="Не удалось инициализировать сессию с сайтом Сириуса")
+
+    if not parser.set_group(group.strip()):
+        raise HTTPException(status_code=500, detail=f"Не удалось выбрать группу {group}")
+
+    if week_offset != 0:
+        if not parser.navigate_to_offset(week_offset):
+            raise HTTPException(status_code=500, detail=f"Не удалось переключить календарь на офсет {week_offset}")
+
+    raw_lessons = parser.parse_events()
 
     days_map = {}
-
     for item in raw_lessons:
-        if not isinstance(item, dict):
-            continue
-
         date_str = item.get("date", "")
         day_name = ""
+        
         if date_str:
             try:
                 dt = datetime.strptime(date_str, "%d.%m.%Y")
@@ -171,11 +288,11 @@ async def get_schedule(
                 pass
 
         lesson_data = {
-            "time_start": item.get("startTime", ""),
-            "time_end": item.get("endTime", ""),
-            "title": item.get("discipline", item.get("name", "")),
-            "type": item.get("groupType", ""),
-            "room": item.get("auditorium", ""),
+            "time_start": item.get("time_start", ""),
+            "time_end": item.get("time_end", ""),
+            "title": item.get("title", ""),
+            "type": item.get("type", ""),
+            "room": item.get("room", ""),
             "teacher": item.get("teacher", ""),
         }
 
@@ -196,7 +313,7 @@ async def get_schedule(
     response = {
         "success": True,
         "group": group,
-        "next_week": next_week,
+        "week_offset": week_offset,
         "total_lessons": len(raw_lessons),
         "days": sorted_days
     }
@@ -209,4 +326,4 @@ async def get_schedule(
 def clear_cache():
     global CACHE
     CACHE.clear()
-    return {"status": "ok", "message": "Кеш очищен"}
+    return {"status": "ok", "message": "Кэш очищен"}
