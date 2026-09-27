@@ -12,12 +12,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Устанавливаем сам Chromium и его системные библиотеки
+# Устанавливаем Chromium и его зависимости
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
-# Копируем остальной код
+# Копируем проект
 COPY . .
 
-# Запускаем FastAPI через Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# Запуск с динамическим портом от Render ($PORT или 10000 по умолчанию)
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
